@@ -1,49 +1,34 @@
 #include "stdio.h"
+#include "stdlib.h"
 #include "time.h"
 #include "curand.h"
 
 #define SPACING 7 
-#define BLOCKSIZE 5 
-#define N (BLOCKSIZE * 2) 
+#define BLOCKSIZE 1024 
+#define N (BLOCKSIZE * 1024) 
 #define CACHE (2 * SPACING + BLOCKSIZE + 1)
+#define HEPT(a) ((a)+3)
 
-/* SPACING : Offset b/w main and distant diagonal */
+/* SPACING : Offset b/w main and distant diagonalgonal */
 /* BLOCKSIZE : Threads per block, multiple of 32 */
 /* N : Row/Column size */
 /* CACHE : Size of shared memory per block */
 
-#define HEPT(a) ((a)+3)
-
-struct sparseMatrix {
-    float* DIA[7];
-} A;
-
-float *X; // (N + 2*SPACING)
-float *B, *V, *P, *R, *AX, *R0, *D, *D2, *H, *S, *T;
+float *X, *B, *V, *P, *R, *AX, *R0, *D, *D2, *H, *S, *T;
+float *Omega, *Rho, *Beta, *Alpha, *Temp, *Error;
 
 struct twofloat {
     float a, b;
 };
 
-__global__ void Assignment ( struct sparseMatrix A, float *X, float *B) {
+struct sparseMatrix {
+    float* diagonal[7];
+} A;
 
-    /* V1 = V2 */
-    int thrId = blockIdx.x * blockDim.x + threadIdx.x;
-
-    A.DIA[HEPT(0)][thrId] = thrId;
-    
-    A.DIA[HEPT(1)][thrId] = 0;
-    A.DIA[HEPT(2)][thrId] = 0;
-    A.DIA[HEPT(3)][thrId] = 0;
-    A.DIA[HEPT(-1)][thrId] = 0;
-    A.DIA[HEPT(-2)][thrId] = 0;
-    A.DIA[HEPT(-3)][thrId] = 0;
-
-    X[thrId] = 1;
-    B[thrId] = 2;
-}
-
-__global__ void heptaMatrixMul ( struct sparseMatrix A, float *X, float *B) { // taking unextended vector X
+__global__ void heptaMatrixMul ( 
+    struct sparseMatrix A, 
+    float *X, 
+    float *B) {
 
     /* B = A.X */
     int thrId = blockIdx.x * blockDim.x + threadIdx.x;
@@ -68,70 +53,129 @@ __global__ void heptaMatrixMul ( struct sparseMatrix A, float *X, float *B) { //
     int zero7 = (ind7 >= 0) && (thrId < (N-SPACING));
 
     float Bvalue;
-    Bvalue = A.DIA[HEPT(3)][thrId] * zero1 * X[ind1 * zero1]
-            + A.DIA[HEPT(2)][thrId] * zero2 *  X[ind2 * zero2]
-            + A.DIA[HEPT(1)][thrId] * zero3 *  X[ind3 * zero3]
-            + A.DIA[HEPT(0)][thrId] * zero4 *  X[ind4 * zero4]
-            + A.DIA[HEPT(-1)][thrId] * zero5 * X[ind5 * zero5]
-            + A.DIA[HEPT(-2)][thrId] * zero6 * X[ind6 * zero6]
-            + A.DIA[HEPT(-3)][thrId] * zero7 * X[ind7 * zero7];
+    Bvalue = A.diagonal[HEPT(3)][thrId] * zero1 * X[ind1 * zero1]
+            + A.diagonal[HEPT(2)][thrId] * zero2 *  X[ind2 * zero2]
+            + A.diagonal[HEPT(1)][thrId] * zero3 *  X[ind3 * zero3]
+            + A.diagonal[HEPT(0)][thrId] * zero4 *  X[ind4 * zero4]
+            + A.diagonal[HEPT(-1)][thrId] * zero5 * X[ind5 * zero5]
+            + A.diagonal[HEPT(-2)][thrId] * zero6 * X[ind6 * zero6]
+            + A.diagonal[HEPT(-3)][thrId] * zero7 * X[ind7 * zero7];
 
     B[thrId] = Bvalue;
 }
 
-__global__ void vecEqual ( float *V1, float *V2) {
+__global__ void vecCopy ( 
+    float *V1, 
+    float *V2) {
 
-    /* V1 = V2 */
     int thrId = blockIdx.x * blockDim.x + threadIdx.x;
-
     V1[thrId] = V2[thrId];
 }
 
-__global__ void vecScaledSum2 ( float *R, float *V1, float *V2, float C, float *V3, float D) {
+__global__ void vecAdd2 ( 
+    float *R, 
+    float *V1, 
+    float *V2, 
+    float *C, 
+    float *V3, 
+    float *D) {
 
-    /* R = V1 + C.V2 + D.V3 */
     int thrId = blockIdx.x * blockDim.x + threadIdx.x;
-
-    R[thrId] = V1[thrId] + C * V2[thrId] + D * V3[thrId];
+    R[thrId] = V1[thrId] + (*C) * (V2[thrId] - (*D) * V3[thrId]);
 }
 
-__global__ void vecScaledSum ( float *R, float *V1, float *V2, float C) {
+__global__ void vecAdd ( 
+    float *R, 
+    float *V1, 
+    float *V2, 
+    float *C, 
+    int sign) {
 
-    /* R = V1 + C.V2 */
     int thrId = blockIdx.x * blockDim.x + threadIdx.x;
-
-    R[thrId] = V1[thrId] + C * V2[thrId];
+    R[thrId] = V1[thrId] + sign * (*C) * V2[thrId];
 }
 
-__global__ void vecDotArray ( float *D, float *V1, float *V2) {
+__global__ void vecMultiply ( 
+    float *D, 
+    float *V1, 
+    float *V2) {
 
-    /* D[i] = V1[i] * V2[i] */
     int thrId = blockIdx.x * blockDim.x + threadIdx.x;
-
     D[thrId] = V1[thrId] * V2[thrId];
 }
 
-__global__ void vecDotArray2 ( float *D, float *V) {
+__global__ void getArraySum(
+    float *A, 
+    float *B, 
+    int num, 
+    float *res) {
 
-    /* D[i] = V[i] * V[i] */
     int thrId = blockIdx.x * blockDim.x + threadIdx.x;
-
-    D[thrId] = V[thrId] * V[thrId];
-}
-
-__global__ void vecAddReduc(float *a, float *b, int n) {
-
-    int tid = blockIdx.x * blockDim.x + threadIdx.x;
-    if ( 2*tid < n) {
-        if ( 2*tid+1 == n)
-            a[tid] = b[2*tid];
+    float* pair;
+    if ( num == 2) {
+        pair = B;
+        A[thrId] = pair[0] + pair[1];
+        *res = pair[0] + pair[1];
+    }
+    else if ( 2 * thrId < num) {
+        if ( 2 * thrId + 1 == num) {
+            A[thrId] = B[2 * thrId];
+        }
         else {
-            struct twofloat B;
-            B = *(struct twofloat *)(b + 2*tid);
-            a[tid] = B.a + B.b;
+            pair = (B + 2 * thrId);
+            A[thrId] = pair[0] + pair[1];
         }
     }
 }
+
+__global__ void getBetaRho( 
+    float *Omega, 
+    float *Rho, 
+    float *Beta, 
+    float *Alpha, 
+    float *Temp) {
+
+    *Beta = (*Temp / *Rho) *
+        ( *Alpha / *Omega);
+    *Rho = *Temp;
+}
+
+__global__ void initOmegaRhoAlpha( 
+    float *Omega, 
+    float *Rho, 
+    float *Alpha) {
+
+    *Rho = 1;
+    *Omega = 1;
+    *Alpha = 1;
+}
+
+__global__ void getAlpha( 
+    float *Alpha, 
+    float *Rho, 
+    float *Temp) {
+
+    *Alpha = *Rho / *Temp;
+}
+
+__global__ void getOmega( 
+    float *Omega, 
+    float *Temp) {
+
+    *Omega = *Omega / *Temp;
+}
+
+void getDotProduct( float *res) {
+    int num = N;
+    while (num > 1) {
+        getArraySum <<<num/BLOCKSIZE+1, BLOCKSIZE>>>(D2, D, num, res);
+        float *Ptr = D2;
+        D2 = D;
+        D = Ptr;
+        num = num/2 + (num%2);
+    }
+}
+
 
 void freeResources ();
 void initialize ();
@@ -139,126 +183,58 @@ void initialize ();
 int main ( int argc, char *argv[]) {
     initialize ();
     
-    float *temp;
-    float val;
-    float *ZERO =(float*) malloc(sizeof(float) * N);
-    int n, i = 0;
+    float Err, elapsed;  
+    int i; 
 
-    for ( int j = 0; j < N; ++j)
-        ZERO[j] = 0;
-    cudaMemcpy(V, ZERO, sizeof(float) * N, cudaMemcpyHostToDevice);
-    cudaMemcpy(P, ZERO, sizeof(float) * N, cudaMemcpyHostToDevice);
+    heptaMatrixMul <<<N/BLOCKSIZE, BLOCKSIZE>>> ( A, X, AX);
+    initOmegaRhoAlpha <<<1, 1>>>( Omega, Rho, Alpha);
+    vecAdd <<<N/BLOCKSIZE, BLOCKSIZE>>>( R, B, AX, Omega, -1);
+    vecMultiply <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, R, R);
+    vecCopy <<<N/BLOCKSIZE, BLOCKSIZE>>>( R0, R);
+
+    cudaEvent_t start, stop;
     
-
-    heptaMatrixMul <<<N/BLOCKSIZE+1, BLOCKSIZE>>> ( A, X, AX);
-
-    vecScaledSum <<<N/BLOCKSIZE, BLOCKSIZE>>>( R, B, AX, -1);
+    for ( i = 0; i < 100; ++i) {
     
-    vecDotArray <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, R, R);
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        cudaEventRecord(start, 0);
 
-    n = N;
-    AGAIN:
-        vecAddReduc <<<n/BLOCKSIZE+1, BLOCKSIZE>>>(D2, D, n);
-        temp = D2;
-        D2 = D;
-        D = temp;
-        n = n/2 + (n%2);
-    if (n > 1) goto AGAIN;
-    cudaMemcpy(&val, D, sizeof(float), cudaMemcpyDeviceToHost);
-
-    vecEqual <<<N/BLOCKSIZE, BLOCKSIZE>>>( R0, R);
-
-    float phi = 1, alpha = 1, omega = 1;
-
-    
-    ITERATE:
-        float phi2;
-        vecDotArray <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, R0, R);
-
-        n = N;
-        AGAIN1:
-            vecAddReduc <<<n/BLOCKSIZE+1, BLOCKSIZE>>>(D2, D, n);
-            temp = D2;
-            D2 = D;
-            D = temp;
-            n = n/2 + (n%2);
-        if (n > 1) goto AGAIN1;
-        cudaDeviceSynchronize();
-        cudaMemcpy(&phi2, D, sizeof(float), cudaMemcpyDeviceToHost);
-
-        float beta = (phi2 / (float)phi) * (alpha / (float)omega);
-        phi = phi2;
-
-        vecScaledSum2 <<<N/BLOCKSIZE, BLOCKSIZE>>>( P, R, P, beta, V, -beta * omega);
-        
+        vecMultiply <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, R0, R);
+        getDotProduct( Temp);
+        getBetaRho <<<1, 1>>>( Omega, Rho, Beta, Alpha, Temp);
+        vecAdd2 <<<N/BLOCKSIZE, BLOCKSIZE>>>( P, R, P, Beta, V, Omega);
         heptaMatrixMul <<<N/BLOCKSIZE, BLOCKSIZE>>> ( A, P, V);
-        
-        vecDotArray <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, R0, V);
-        n = N;
-        AGAIN2:
-            vecAddReduc <<<n/BLOCKSIZE+1, BLOCKSIZE>>>(D2, D, n);
-            temp = D2;
-            D2 = D;
-            D = temp;
-            n = n/2 + (n%2);
-        if (n > 1) goto AGAIN2;
-        cudaDeviceSynchronize();
-        cudaMemcpy(&alpha, D, sizeof(float), cudaMemcpyDeviceToHost);
-        alpha = phi / (float)alpha;
-
-        vecScaledSum <<<N/BLOCKSIZE, BLOCKSIZE>>>( H, X, P, alpha);
-        
-        vecScaledSum <<<N/BLOCKSIZE, BLOCKSIZE>>>( S, R, V, -alpha);
-
+        vecMultiply <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, R0, V);
+        getDotProduct( Temp);
+        getAlpha <<<1, 1>>>( Alpha, Rho, Temp);
+        vecAdd <<<N/BLOCKSIZE, BLOCKSIZE>>>( H, X, P, Alpha, 1);
+        vecAdd <<<N/BLOCKSIZE, BLOCKSIZE>>>( S, R, V, Alpha, -1);
         heptaMatrixMul <<<N/BLOCKSIZE, BLOCKSIZE>>> ( A, S, T);
+        vecMultiply <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, T, S);
+        getDotProduct( Omega);
+        vecMultiply <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, T, T);
+        getDotProduct( Temp);
+        getOmega <<<1, 1>>>( Omega, Temp);
+        vecAdd <<<N/BLOCKSIZE, BLOCKSIZE>>>( X, H, S, Omega, 1);
+        vecAdd <<<N/BLOCKSIZE, BLOCKSIZE>>>( R, S, T, Omega, -1);
+        vecMultiply <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, R, R);
+        getDotProduct( Error);
 
-        vecDotArray <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, T, S);
-        n = N;
-        AGAIN3:
-            vecAddReduc <<<n/BLOCKSIZE+1, BLOCKSIZE>>>(D2, D, n);
-            temp = D2;
-            D2 = D;
-            D = temp;
-            n = n/2 + (n%2);
-        if (n > 1) goto AGAIN3;
-        cudaDeviceSynchronize();
-        cudaMemcpy(&omega, D, sizeof(float), cudaMemcpyDeviceToHost);
-        
-        vecDotArray2 <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, T);
+        cudaEventRecord(stop, 0);
+        cudaEventSynchronize (stop);
+        cudaEventElapsedTime(&elapsed, start, stop);
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
 
-        float denom;
-        n = N;
-        AGAIN4:
-            vecAddReduc <<<n/BLOCKSIZE+1,BLOCKSIZE>>>(D2, D, n);
-            temp = D2;
-            D2 = D;
-            D = temp;
-            n = n/2 + (n%2);
-        if (n > 1) goto AGAIN4;
-        cudaDeviceSynchronize();
-        cudaMemcpy(&denom, D, sizeof(float), cudaMemcpyDeviceToHost);
-        omega = omega / (float)denom;
-        
-        vecScaledSum <<<N/BLOCKSIZE, BLOCKSIZE>>>( X, H, S, omega);
 
-        vecScaledSum <<<N/BLOCKSIZE, BLOCKSIZE>>>( R, S, T, -omega);
+        if (i % 10 == 0) {
+            cudaDeviceSynchronize();
+            cudaMemcpy(&Err, Error, sizeof(float), cudaMemcpyDeviceToHost);
+            printf("time : %f\terr : %f\n", elapsed, Err);
+        }
+    }
 
-        vecDotArray <<<N/BLOCKSIZE, BLOCKSIZE>>>( D, R, R);
-        float Err;
-        n = N;
-        AGAIN5:
-            vecAddReduc <<<n/BLOCKSIZE+1, BLOCKSIZE>>>(D2, D, n);
-            temp = D2;
-            D2 = D;
-            D = temp;
-            n = n/2 + (n%2);
-        if (n > 1) goto AGAIN5;
-        cudaDeviceSynchronize();
-        cudaMemcpy(&Err, D, sizeof(float), cudaMemcpyDeviceToHost);
-
-        if (i %10 ==0) printf("err : %f\n", Err);
-        ++i;
-    if (i < 100) goto ITERATE;
     freeResources ();
     return 0;
 }
@@ -266,15 +242,26 @@ int main ( int argc, char *argv[]) {
  /* Random floats generation of Hepta Matrix using lib cuRAND */
 
 void freeResources() {
+    cudaFree(T);
+    cudaFree(S);
+    cudaFree(P);
+    cudaFree(V);
+    cudaFree(H);
+    cudaFree(D);
+    cudaFree(D2);
+    cudaFree(R);
+    cudaFree(R0);
+    cudaFree(AX);
+
     cudaFree(X);
     cudaFree(B);
-    cudaFree( A.DIA[HEPT(0)]);
-    cudaFree( A.DIA[HEPT(-1)]);
-    cudaFree( A.DIA[HEPT(1)]);
-    cudaFree( A.DIA[HEPT(-2)]);
-    cudaFree( A.DIA[HEPT(2)]);
-    cudaFree( A.DIA[HEPT(-3)]);
-    cudaFree( A.DIA[HEPT(3)]);
+    cudaFree( A.diagonal[HEPT(0)]);
+    cudaFree( A.diagonal[HEPT(-1)]);
+    cudaFree( A.diagonal[HEPT(1)]);
+    cudaFree( A.diagonal[HEPT(-2)]);
+    cudaFree( A.diagonal[HEPT(2)]);
+    cudaFree( A.diagonal[HEPT(-3)]);
+    cudaFree( A.diagonal[HEPT(3)]);
 }
 
 void initialize() {
@@ -288,6 +275,13 @@ void initialize() {
     cudaMalloc(&B, N* sizeof(float));
 
     
+    cudaMalloc(&Omega, sizeof(float));
+    cudaMalloc(&Rho, sizeof(float));
+    cudaMalloc(&Beta, sizeof(float));
+    cudaMalloc(&Alpha, sizeof(float));
+    cudaMalloc(&Temp, sizeof(float));
+    cudaMalloc(&Error, sizeof(float));
+
     cudaMalloc(&V, N* sizeof(float));
     cudaMalloc(&R, N* sizeof(float));
     cudaMalloc(&P, N* sizeof(float));
@@ -299,29 +293,56 @@ void initialize() {
     cudaMalloc(&S, N* sizeof(float));
     cudaMalloc(&T, N* sizeof(float));
 
-    /* Extended diagonals of Hepta-Mat A */
-    cudaMalloc(&A.DIA[HEPT(0)],     N* sizeof(float));
-    cudaMalloc(&A.DIA[HEPT(-1)],    N* sizeof(float));
-    cudaMalloc(&A.DIA[HEPT(1)],     N* sizeof(float));
-    cudaMalloc(&A.DIA[HEPT(-2)],    N* sizeof(float));
-    cudaMalloc(&A.DIA[HEPT(2)],     N* sizeof(float));
-    cudaMalloc(&A.DIA[HEPT(-3)],    N* sizeof(float));
-    cudaMalloc(&A.DIA[HEPT(3)],     N* sizeof(float));
+    /* Extended diagonalgonals of Hepta-Mat A */
+    cudaMalloc(&A.diagonal[HEPT(0)],     N* sizeof(float));
+    cudaMalloc(&A.diagonal[HEPT(-1)],    N* sizeof(float));
+    cudaMalloc(&A.diagonal[HEPT(1)],     N* sizeof(float));
+    cudaMalloc(&A.diagonal[HEPT(-2)],    N* sizeof(float));
+    cudaMalloc(&A.diagonal[HEPT(2)],     N* sizeof(float));
+    cudaMalloc(&A.diagonal[HEPT(-3)],    N* sizeof(float));
+    cudaMalloc(&A.diagonal[HEPT(3)],     N* sizeof(float));
 
+    /* Filling random floats in A and X */
+    float *Array = (float *) malloc(N* sizeof(float));
+    for ( int i = 0; i < N; ++i) Array[i] = rand() / (float)RAND_MAX / (float)N;
+    cudaMemcpy(A.diagonal[HEPT(1)], Array, N*sizeof(float), cudaMemcpyHostToDevice);
+    for ( int i = 0; i < N; ++i) Array[i] = rand() / (float)RAND_MAX / (float)N;
+    cudaMemcpy(A.diagonal[HEPT(2)], Array, N*sizeof(float), cudaMemcpyHostToDevice);
+    for ( int i = 0; i < N; ++i) Array[i] = rand() / (float)RAND_MAX / (float)N;
+    cudaMemcpy(A.diagonal[HEPT(3)], Array, N*sizeof(float), cudaMemcpyHostToDevice);
+    for ( int i = 0; i < N; ++i) Array[i] = rand() / (float)RAND_MAX / (float)N;
+    cudaMemcpy(A.diagonal[HEPT(-3)], Array, N*sizeof(float), cudaMemcpyHostToDevice);
+    for ( int i = 0; i < N; ++i) Array[i] = rand() / (float)RAND_MAX / (float)N;
+    cudaMemcpy(A.diagonal[HEPT(-2)], Array, N*sizeof(float), cudaMemcpyHostToDevice);
+    for ( int i = 0; i < N; ++i) Array[i] = rand() / (float)RAND_MAX / (float)N;
+    cudaMemcpy(A.diagonal[HEPT(-1)], Array, N*sizeof(float), cudaMemcpyHostToDevice);
+    for ( int i = 0; i < N; ++i) Array[i] = rand() / (float)RAND_MAX / (float)N;
+    cudaMemcpy(A.diagonal[HEPT(0)], Array, N*sizeof(float), cudaMemcpyHostToDevice);
     
-    curandGenerator_t gen;
+    for ( int i = 0; i < N; ++i) Array[i] = rand() / (float)RAND_MAX / (float)N;
+    cudaMemcpy(B, Array, N*sizeof(float), cudaMemcpyHostToDevice);
+    for ( int i = 0; i < N; ++i) Array[i] = rand() / (float)RAND_MAX / (float)N;
+    cudaMemcpy(X, Array, N*sizeof(float), cudaMemcpyHostToDevice);
+    
+    
+    for ( int i = 0; i < N; ++i) Array[i] = 0;
+    cudaMemcpy(V, Array, sizeof(float) * N, cudaMemcpyHostToDevice);
+    cudaMemcpy(P, Array, sizeof(float) * N, cudaMemcpyHostToDevice);
+    
+    free(Array);
+
+    /*curandGenerator_t gen;
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
     curandSetPseudoRandomGeneratorSeed(gen, 1234ULL);
 
-    /* Filling random floats in A and X */
     curandGenerateUniform(gen, X, N);
     curandGenerateUniform(gen, B, N);
-    curandGenerateUniform(gen, A.DIA[HEPT(0)],  N);
-    curandGenerateUniform(gen, A.DIA[HEPT(-1)], N);
-    curandGenerateUniform(gen, A.DIA[HEPT(1)],  N);
-    curandGenerateUniform(gen, A.DIA[HEPT(-2)], N);
-    curandGenerateUniform(gen, A.DIA[HEPT(2)],  N);
-    curandGenerateUniform(gen, A.DIA[HEPT(-3)], N);
-    curandGenerateUniform(gen, A.DIA[HEPT(3)],  N);
-
+    curandGenerateUniform(gen, A.diagonal[HEPT(0)],  N);
+    curandGenerateUniform(gen, A.diagonal[HEPT(-1)], N);
+    curandGenerateUniform(gen, A.diagonal[HEPT(1)],  N);
+    curandGenerateUniform(gen, A.diagonal[HEPT(-2)], N);
+    curandGenerateUniform(gen, A.diagonal[HEPT(2)],  N);
+    curandGenerateUniform(gen, A.diagonal[HEPT(-3)], N);
+    curandGenerateUniform(gen, A.diagonal[HEPT(3)],  N);
+    curandDestroyGenerator(gen);*/
 }
