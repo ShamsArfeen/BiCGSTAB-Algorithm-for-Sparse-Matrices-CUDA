@@ -3,8 +3,8 @@
 #include "curand.h"
 
 #define SPACING 7 
-#define BLOCKSIZE 1024 
-#define N (BLOCKSIZE * 1000) 
+#define BLOCKSIZE 128 
+#define N (1024 * 1000) 
 #define CACHE (2 * SPACING + BLOCKSIZE + 1)
 
 /* SPACING : Offset b/w main and distant diagonal */
@@ -21,6 +21,9 @@ struct sparseMatrix {
 float *X;
 float *B;
 
+
+void freeResources ();
+void initialize ();
 
 __global__ void heptaMatrixMul ( struct sparseMatrix A, float *X, float *B) {
 
@@ -53,7 +56,7 @@ __global__ void heptaMatrixMulSharedMem ( struct sparseMatrix A, float *X, float
     int i, OFFSET = blockIdx.x * blockDim.x;
     __shared__ float Xc[CACHE];
 
-    for ( i = threadIdx.x; i < CACHE; i+= blockDim.x )
+    for ( i = threadIdx.x; i < (2 * SPACING + blockDim.x + 1); i+= blockDim.x )
         Xc[i] = X[OFFSET + i];
 
     __syncthreads();
@@ -78,29 +81,60 @@ void performance () {
     /* Performance measure for Shared Memory Vs. only Global Memory */
 
     int i;
-    float resultSharedMem[N], resultGlobalMem[N], Time;
-    clock_t begin, end;
+    float resultSharedMem[N], resultGlobalMem[N];
 
-    begin = clock();
-    heptaMatrixMulSharedMem <<<N/BLOCKSIZE, BLOCKSIZE>>> ( A, X, B);
-    cudaDeviceSynchronize();
 
-    end = clock();
-    Time = (float)(end - begin) / CLOCKS_PER_SEC;
-    printf("SHARED MEMORY TIME: %f\n", Time);
 
-    cudaMemcpy(resultSharedMem, B, 
+    float elapsed=0;
+    cudaEvent_t start, stop;
+
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start, 0);
+
+    heptaMatrixMul <<<N/BLOCKSIZE, BLOCKSIZE>>> ( A, X, B);
+
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize (stop);
+
+    cudaEventElapsedTime(&elapsed, start, stop);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    printf("GLOBAL MEMORY TIME: %f\n", elapsed);
+
+
+
+
+    cudaMemcpy(resultGlobalMem, B, 
         sizeof(float) * N, cudaMemcpyDeviceToHost);
 
-    begin = clock();
-    heptaMatrixMul <<<N/BLOCKSIZE, BLOCKSIZE>>> ( A, X, B);
-    cudaDeviceSynchronize();
+    freeResources (); /* Flushing and Refilling */
+    initialize (); /* to refresh GPU caches */
 
-    end = clock();
-    Time = (float)(end - begin) / CLOCKS_PER_SEC;
-    printf("GLOBAL MEMORY TIME: %f\n", Time);
+
+    elapsed=0;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+
+    cudaEventRecord(start, 0);
+
+    heptaMatrixMulSharedMem <<<N/BLOCKSIZE, BLOCKSIZE>>> ( A, X, B);
+
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize (stop);
+
+    cudaEventElapsedTime(&elapsed, start, stop);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    printf("SHARED MEMORY TIME: %f\n", elapsed);
+
     
-    cudaMemcpy(resultGlobalMem, B, 
+    cudaMemcpy(resultSharedMem, B, 
         sizeof(float) * N, cudaMemcpyDeviceToHost);
     
     printf("\n SHARED  \tGLOBAL\n");
@@ -113,9 +147,6 @@ void performance () {
             printf("Error %f %f  :(\n", resultSharedMem[i], resultGlobalMem[i]);
     printf("Results are Equivalent\n");
 }
-
-void freeResources ();
-void initialize ();
 
 int main ( int argc, char *argv[]) {
     initialize ();
@@ -171,4 +202,6 @@ void initialize() {
     curandGenerateUniform(gen, A.DIA[HEPT(2)],  N);
     curandGenerateUniform(gen, A.DIA[HEPT(-3)], N);
     curandGenerateUniform(gen, A.DIA[HEPT(3)],  N);
+
+    curandDestroyGenerator(gen);
 }

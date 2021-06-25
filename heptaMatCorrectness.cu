@@ -8,6 +8,7 @@
 #define SPACING 7
 #define BLOCKSIZE 64
 #define N (BLOCKSIZE * 100) 
+#define ITER 16
 #define CACHE (2 * SPACING + BLOCKSIZE + 1)
 
 /* SPACING : Offset b/w main and distant diagonal, greater than 2 */
@@ -27,30 +28,34 @@ float *B;
  /* Host Arrays for Correctness check */
 float As[N][N], Xs[N], Bs[N];
 
-__global__ void heptaMatrixMul( struct sparseMatrix A, float *X, float *B) {
+__global__ void heptaMatrixMul( struct sparseMatrix A, float *X, float *B, int n) {
 
     int thrId = blockIdx.x * blockDim.x + threadIdx.x;
 
-    int i;
+    int i, t, k = 0;
     __shared__ float Xc[CACHE];
 
-    for ( i = threadIdx.x; i < CACHE; i+= blockDim.x )
-        Xc[i] = X[blockIdx.x * blockDim.x + i];
+    for ( t = thrId; t < n; t += gridDim.x * blockDim.x) {
 
-    __syncthreads();
-
-    int middle = SPACING + threadIdx.x;
-
-    float Bvalue;
-    Bvalue =    A.DIA[HEPT(3)][thrId]   *Xc[threadIdx.x]
-            +   A.DIA[HEPT(2)][thrId]   *Xc[middle - 2]
-            +   A.DIA[HEPT(1)][thrId]   *Xc[middle - 1]
-            +   A.DIA[HEPT(0)][thrId]   *Xc[middle]
-            +   A.DIA[HEPT(-1)][thrId]  *Xc[middle + 1]
-            +   A.DIA[HEPT(-2)][thrId]  *Xc[middle + 2]
-            +   A.DIA[HEPT(-3)][thrId]  *Xc[middle + SPACING];
-
-    B[thrId] = Bvalue;
+        for ( i = threadIdx.x; i < (2 * SPACING + blockDim.x + 1); i+= blockDim.x )
+            Xc[i] = X[(blockIdx.x + k*gridDim.x) * blockDim.x + i];
+    
+        __syncthreads();
+    
+        int middle = SPACING + threadIdx.x;
+    
+        float Bvalue;
+        Bvalue =    A.DIA[HEPT(3)][t]   *Xc[threadIdx.x]
+                +   A.DIA[HEPT(2)][t]   *Xc[middle - 2]
+                +   A.DIA[HEPT(1)][t]   *Xc[middle - 1]
+                +   A.DIA[HEPT(0)][t]   *Xc[middle]
+                +   A.DIA[HEPT(-1)][t]  *Xc[middle + 1]
+                +   A.DIA[HEPT(-2)][t]  *Xc[middle + 2]
+                +   A.DIA[HEPT(-3)][t]  *Xc[middle + SPACING];
+    
+        B[t] = Bvalue;
+        ++k;
+    }
 }
 
 void heptaMatSerial( float (*A)[N], float *X, float *B) {
@@ -143,31 +148,41 @@ void verify() {
         Bs[i] = Bvalue;
     }
 
-    clock_t begin, end;
+    float elapsed=0;
+    cudaEvent_t start, stop;
 
-    begin = clock();
-    heptaMatrixMul <<<N/BLOCKSIZE, BLOCKSIZE>>> ( A, X, B);
-    cudaDeviceSynchronize();
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
 
-    end = clock();
-    Time = (float)(end - begin) / CLOCKS_PER_SEC;
-    printf("GPU TIME: %f\n", Time);
+    cudaEventRecord(start, 0);
+
+    heptaMatrixMul <<<N/BLOCKSIZE/ITER+1, BLOCKSIZE>>> ( A, X, B, N);
+
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize (stop);
+
+    cudaEventElapsedTime(&elapsed, start, stop);
+
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    printf("GPU TIME: %f ms\n", elapsed);
     cudaMemcpy(B2, B, 
         sizeof(float) * N, cudaMemcpyDeviceToHost);
 
+    clock_t begin, end;
     begin = clock();
     heptaMatSerial( Ah, Xh, Bh);
 
     end = clock();
     Time = (float)(end - begin) / CLOCKS_PER_SEC;
-    printf("CPU TIME: %f\n", Time);
+    printf("CPU TIME: %f s\n", Time);
 
     printf("\n CUDA   \tOPENMP  \tSERIAL (MV-SAXPY)\n");
     for ( i = 0; i < 2 * SPACING; ++i)
         printf(" %f\t%f\t%f\n", B2[i], Bh[i], Bs[i]);
         
     for ( i = 0; i < N; ++i)
-        if (abs(B2[i] - Bh[i]) > 1e-04 && abs(Bs[i] - Bh[i]) > 1e-04) printf("Error %f %f %f  :(\n", B2[i], Bh[i], Bs[i]);
+        if (abs(B2[i] - Bh[i]) > 1e-04 || abs(Bs[i] - Bh[i]) > 1e-04) printf("Error %f %f %f  :(\n", B2[i], Bh[i], Bs[i]);
     printf("Results are Equivalent\n");
 }
 

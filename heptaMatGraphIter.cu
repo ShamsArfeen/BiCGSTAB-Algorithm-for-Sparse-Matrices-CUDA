@@ -7,18 +7,18 @@
 /* nvcc heptaMatCorrectness.cu -Xcompiler -fopenmp */
 
 #define SPACING 7
-#define BLOCKSIZE 1024
+#define BLOCKSIZE 128
 #define N (1024 * 1000) 
 #define CACHE (2 * SPACING + BLOCKSIZE + 1)
 #define ITER 32
 
 /* SPACING : Offset b/w main and distant diagonal, greater than 2 */
-/* BLOCKSIZE : Threads per block, multiple of 32 */
+/* BLOCKSIZE : Threads per iter, multiple of 32 */
 /* N : Row/Column size */
-/* CACHE : Size of shared memory per block */
+/* CACHE : Size of shared memory per iter */
 
 #define HEPT(a) ((a)+3)
-int BLOCK;
+int iter;
 
 struct sparseMatrix {
     float* DIA[7];
@@ -31,48 +31,55 @@ int n;
 float Ah[7][N], Xh[(N + 2*SPACING)], Bh[N];
 
 
-__global__ void heptaMatrixMul( struct sparseMatrix A, float *X, float *B) {
+__global__ void heptaMatrixMul( struct sparseMatrix A, float *X, float *B, int n) {
 
     int thrId = blockIdx.x * blockDim.x + threadIdx.x;
+    int t;
+    for ( t = thrId; t < n; t += gridDim.x * blockDim.x) {
+        
+        int middle = SPACING + t;
 
-    int middle = SPACING + thrId;
+        float Bvalue;
+        Bvalue =    A.DIA[HEPT(3)][t]   *X[t]
+                +   A.DIA[HEPT(2)][t]   *X[middle - 2]
+                +   A.DIA[HEPT(1)][t]   *X[middle - 1]
+                +   A.DIA[HEPT(0)][t]   *X[middle]
+                +   A.DIA[HEPT(-1)][t]  *X[middle + 1]
+                +   A.DIA[HEPT(-2)][t]  *X[middle + 2]
+                +   A.DIA[HEPT(-3)][t]  *X[middle + SPACING];
 
-    float Bvalue;
-    Bvalue =    A.DIA[HEPT(3)][thrId]   *X[thrId]
-            +   A.DIA[HEPT(2)][thrId]   *X[middle - 2]
-            +   A.DIA[HEPT(1)][thrId]   *X[middle - 1]
-            +   A.DIA[HEPT(0)][thrId]   *X[middle]
-            +   A.DIA[HEPT(-1)][thrId]  *X[middle + 1]
-            +   A.DIA[HEPT(-2)][thrId]  *X[middle + 2]
-            +   A.DIA[HEPT(-3)][thrId]  *X[middle + SPACING];
-
-    B[thrId] = Bvalue;
+        B[t] = Bvalue;
+    }
 }
 
-__global__ void heptaMatrixMulSharedMem( struct sparseMatrix A, float *X, float *B) {
+__global__ void heptaMatrixMulSharedMem( struct sparseMatrix A, float *X, float *B, int n) {
 
     int thrId = blockIdx.x * blockDim.x + threadIdx.x;
 
-    int i;
+    int i, t, k = 0;
     __shared__ float Xc[CACHE];
 
-    for ( i = threadIdx.x; i < (2 * SPACING + blockDim.x + 1); i+= blockDim.x )
-        Xc[i] = X[blockIdx.x * blockDim.x + i];
+    for ( t = thrId; t < n; t += gridDim.x * blockDim.x) {
 
-    __syncthreads();
-
-    int middle = SPACING + threadIdx.x;
-
-    float Bvalue;
-    Bvalue =    A.DIA[HEPT(3)][thrId]   *Xc[threadIdx.x]
-            +   A.DIA[HEPT(2)][thrId]   *Xc[middle - 2]
-            +   A.DIA[HEPT(1)][thrId]   *Xc[middle - 1]
-            +   A.DIA[HEPT(0)][thrId]   *Xc[middle]
-            +   A.DIA[HEPT(-1)][thrId]  *Xc[middle + 1]
-            +   A.DIA[HEPT(-2)][thrId]  *Xc[middle + 2]
-            +   A.DIA[HEPT(-3)][thrId]  *Xc[middle + SPACING];
-
-    B[thrId] = Bvalue;
+        for ( i = threadIdx.x; i < (2 * SPACING + blockDim.x + 1); i+= blockDim.x )
+            Xc[i] = X[(blockIdx.x + k*gridDim.x) * blockDim.x + i];
+    
+        __syncthreads();
+    
+        int middle = SPACING + threadIdx.x;
+    
+        float Bvalue;
+        Bvalue =    A.DIA[HEPT(3)][t]   *Xc[threadIdx.x]
+                +   A.DIA[HEPT(2)][t]   *Xc[middle - 2]
+                +   A.DIA[HEPT(1)][t]   *Xc[middle - 1]
+                +   A.DIA[HEPT(0)][t]   *Xc[middle]
+                +   A.DIA[HEPT(-1)][t]  *Xc[middle + 1]
+                +   A.DIA[HEPT(-2)][t]  *Xc[middle + 2]
+                +   A.DIA[HEPT(-3)][t]  *Xc[middle + SPACING];
+    
+        B[t] = Bvalue;
+        ++k;
+    }
 }
 
 void heptaMatSerial( float (*A)[N], float *X, float *B) {
@@ -100,12 +107,12 @@ void run() {
     curandGenerator_t gen;
     curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_DEFAULT);
 
-    for ( BLOCK = 32; BLOCK <= BLOCKSIZE; BLOCK *= 2 ) {
+    for ( iter = 1; iter <= BLOCKSIZE; iter *= 4 ) {
         float elapsed=0;
         cudaEvent_t start, stop;
 
         
-        curandSetPseudoRandomGeneratorSeed(gen, BLOCK);
+        curandSetPseudoRandomGeneratorSeed(gen, iter);
 
         /* Filling random floats in A and X to flush GPU caches */
         curandGenerateUniform(gen, X, N);
@@ -122,7 +129,7 @@ void run() {
 
         cudaEventRecord(start, 0);
 
-        heptaMatrixMul <<<n/BLOCK, BLOCK>>> ( A, X, B);
+        heptaMatrixMul <<<n/BLOCKSIZE/iter, BLOCKSIZE>>> ( A, X, B, n);
 
         cudaEventRecord(stop, 0);
         cudaEventSynchronize (stop);
@@ -136,11 +143,11 @@ void run() {
     }
     
 
-    for ( BLOCK = 32; BLOCK <= BLOCKSIZE; BLOCK *= 2 ) {
+    for ( iter = 1; iter <= BLOCKSIZE; iter *= 4 ) {
         float elapsed=0;
         cudaEvent_t start, stop;
 
-        curandSetPseudoRandomGeneratorSeed(gen, BLOCK);
+        curandSetPseudoRandomGeneratorSeed(gen, iter);
 
         /* Filling random floats in A and X to flush GPU caches */
         curandGenerateUniform(gen, X, N);
@@ -157,7 +164,7 @@ void run() {
 
         cudaEventRecord(start, 0);
 
-        heptaMatrixMulSharedMem <<<n/BLOCK, BLOCK>>> ( A, X, B);
+        heptaMatrixMulSharedMem <<<n/BLOCKSIZE/iter, BLOCKSIZE>>> ( A, X, B, n);
 
         cudaEventRecord(stop, 0);
         cudaEventSynchronize (stop);
@@ -185,15 +192,15 @@ void freeResources ();
 int main ( int argc, char *argv[]) {
 
     printf(" N\t");
-    for ( BLOCK = 32; BLOCK <= BLOCKSIZE; BLOCK *= 2 ) {
-        printf("%d-GLOBL\t", BLOCK);
+    for ( iter = 1; iter <= BLOCKSIZE; iter *= 4 ) {
+        printf("%d-GLOBL\t", iter);
     }
-    for ( BLOCK = 32; BLOCK <= BLOCKSIZE; BLOCK *= 2 ) {
-        printf("%d-SHARE\t", BLOCK);
+    for ( iter = 1; iter <= BLOCKSIZE; iter *= 4 ) {
+        printf("%d-SHARE\t", iter);
     }
     printf("OPENMP\n");
 
-    for ( n = BLOCKSIZE * 600; n <= N; n += BLOCKSIZE * 100) {
+    for ( n = BLOCKSIZE * 6000; n <= N; n += BLOCKSIZE * 500) {
         printf("%d\t", n);
         initialize ();
         run();
